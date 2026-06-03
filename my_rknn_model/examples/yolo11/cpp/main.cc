@@ -332,14 +332,18 @@ int main(int argc, char **argv)
 
                 ThreatResult result = threat_analyzer.update(frame_index, t.track_id, t.label, box);
 
-                char threat_text[128];
-                snprintf(threat_text, sizeof(threat_text), "D%.1fm V%.1fm/s S%d %s",
-                         result.distance_m, result.speed_mps, result.score, result.type);
+                char threat_text[160];
+                snprintf(threat_text, sizeof(threat_text), "%sD%.1fm V%.1fkm/h T%.2f %s",
+                         result.is_dangerous ? "[DANGER] " : "",
+                         result.distance_m, result.speed_kmh, result.threat_score, result.type);
 
+                // 危险目标红色，否则黄色（对齐 video_alarm.py 的红/绿配色思路）
+                cv::Scalar threat_color = result.is_dangerous ? cv::Scalar(0, 0, 255)
+                                                              : cv::Scalar(0, 255, 255);
                 int text_y = std::max(16, box.y + box.h + 16);
                 cv::putText(model->ori_img, threat_text,
                             cv::Point(box.x, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                            cv::Scalar(0, 255, 255), 1);
+                            threat_color, 1);
 
                 if (threat_logger.enabled()) {
                     ThreatLogRecord rec;
@@ -351,8 +355,9 @@ int main(int argc, char **argv)
                     rec.w = box.w;
                     rec.h = box.h;
                     rec.distance_m = result.distance_m;
-                    rec.speed_mps = result.speed_mps;
-                    rec.score = result.score;
+                    rec.speed_kmh = result.speed_kmh;
+                    rec.threat_score = result.threat_score;
+                    rec.is_dangerous = result.is_dangerous;
                     rec.type = result.type;
                     threat_logger.log(rec);
                 }
