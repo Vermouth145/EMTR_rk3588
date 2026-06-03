@@ -1,0 +1,2 @@
+sudo bash ./build-linux.sh -t rk3588 -a aarch64 -d yolo11 -b Release
+

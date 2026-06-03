@@ -1,0 +1,47 @@
+# ===== 大文件 / 二进制：不进 git =====
+# 视频（输入样例 + 程序输出）
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# 压缩包 / 打包备份
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# 第三方预编译库（应由各自 SDK 提供，不纳入源码仓库）
+*.a
+*.so
+*.so.*
+*.lib
+*.dll
+*.dylib
+
+# 模型权重（.onnx 较大；.rknn 如需可单独 git add -f 强加）
+*.onnx
+
+# ===== 编译 / 安装产物 =====
+build/
+build_*/
+out/
+cmake-build-*/
+install/
+install_*/
+*.out/
+*.o
+*.obj
+
+# 运行期输出
+threat.jsonl
+threat_demo.jsonl
+*.log
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+.vs/
+*.user
+Thumbs.db
+.DS_Store
