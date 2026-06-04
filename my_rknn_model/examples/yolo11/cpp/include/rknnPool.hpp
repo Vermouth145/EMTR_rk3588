@@ -6,8 +6,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <vector>
+#include <queue>
+#include <future>
+#include <sys/time.h>
 
 #include "opencv2/core/core.hpp"
 #include "opencv2/highgui/highgui.hpp"
@@ -32,6 +36,13 @@
 #ifndef ERROR_LOG
 #define ERROR_LOG(fmt, ...) printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
 #endif
+
+// 单帧推理耗时（毫秒），用于主线程聚合统计 [STATS]
+struct InferTiming {
+    double pre_ms   = 0.0;
+    double infer_ms = 0.0;
+    double post_ms  = 0.0;
+};
 
 static unsigned char *load_model(const char *filename, int *model_size)
 {
@@ -64,16 +75,19 @@ static unsigned char *load_model(const char *filename, int *model_size)
     return data;
 }
 
+// 纯推理实例：pre + rknn_run + post，输出原图坐标系的检测框。
+// 不再持有 BYTETracker、不绘制、不计帧序——跟踪/威胁/绘制全部放到主线程，
+// 因此本类的一个实例同一时刻只能被一个线程使用（由 RknnPool 的空闲表保证）。
 class rknn_lite
 {
 public:
-    cv::Mat ori_img;
     int instance_id;
 
+    // n: NPU 核索引(0/1/2 -> RKNN_NPU_CORE_0/1/2)；id: 实例编号(打印用)
     rknn_lite(char *model_name, int n, int id)
     {
         instance_id = id;
-        INFO_LOG("Instance %d: Initializing...", instance_id);
+        INFO_LOG("Instance %d: Initializing on NPU core %d...", instance_id, n);
 
         int model_data_size = 0;
         model_data = load_model(model_name, &model_data_size);
@@ -157,8 +171,6 @@ public:
 
         input_buffer.resize(static_cast<size_t>(width) * height * channel);
 
-        tracker = std::make_unique<BYTETracker>(30, 90);
-
         INFO_LOG("Instance %d: Initialization complete", instance_id);
     }
 
@@ -170,35 +182,22 @@ public:
         if (rkModel)      rknn_destroy(rkModel);
     }
 
-    void set_track_interval(int interval)
-    {
-        if (interval < 1) {
-            interval = 1;
-        }
-        track_interval = interval;
-    }
+    int input_width()  const { return width; }
+    int input_height() const { return height; }
 
-    const std::vector<STrack> &get_last_tracks() const
+    // 纯推理：对 frame 做 pre + rknn_run + post，输出原图坐标系检测框到 objs。
+    // 返回 0 成功；-1 失败。timing 非空时填充各阶段耗时。
+    int infer_only(const cv::Mat &frame, std::vector<Object> &objs,
+                   bool enable_rga, InferTiming *timing = nullptr)
     {
-        return last_tracks;
-    }
-
-    int get_frame_index() const
-    {
-        return frame_index;
-    }
-
-    int interf(bool draw_result = true, bool enable_track = true, bool enable_rga = false)
-    {
-        if (ori_img.empty()) {
+        if (frame.empty()) {
             ERROR_LOG("Instance %d: Empty input frame", instance_id);
             return -1;
         }
 
         int64_t t0 = now_ms();
 
-        cv::Mat img = ori_img; // BGR input from OpenCV capture
-
+        const cv::Mat &img = frame; // BGR input from OpenCV capture
         int img_width  = img.cols;
         int img_height = img.rows;
 
@@ -211,20 +210,12 @@ public:
         compute_letter_box(&letter_box);
 
         cv::Mat processed_img;
-        if (enable_rga && !preprocess_rga(img, processed_img, letter_box)) {
-            cv::Mat rgb;
-            cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
-            if (img_width != width || img_height != height) {
-                cv::resize(rgb, processed_img,
-                           cv::Size(letter_box.resize_width, letter_box.resize_height));
-                cv::copyMakeBorder(processed_img, processed_img,
-                    letter_box.h_pad_top,  letter_box.h_pad_bottom,
-                    letter_box.w_pad_left, letter_box.w_pad_right,
-                    cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
-            } else {
-                processed_img = rgb;
-            }
-        } else if (!enable_rga) {
+        bool rga_ok = false;
+        if (enable_rga) {
+            rga_ok = preprocess_rga(img, processed_img, letter_box);
+        }
+        if (!rga_ok) {
+            // CPU 回退：BGR->RGB + resize + letterbox padding
             cv::Mat rgb;
             cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
             if (img_width != width || img_height != height) {
@@ -285,8 +276,8 @@ public:
         post_process(rkModel, outputs.data(), &letter_box, box_conf_threshold, nms_threshold,
                      &detect_result_group, width, height, io_num, output_attrs, true, 1);
 
-        // 只取 cameraid==1 的结果
-        std::vector<Object> objs;
+        // 只取 cameraid==1 的结果，转为原图坐标系的 Object
+        objs.clear();
         for (int i = 0; i < detect_result_group.count; ++i) {
             detect_result_t *d = &detect_result_group.results[i];
             if (d->cameraid != 1) continue;
@@ -299,63 +290,15 @@ public:
             objs.push_back(o);
         }
 
-        if (enable_track) {
-            bool do_track = (track_interval <= 1) || (frame_index % track_interval == 0);
-            if (do_track) {
-                last_tracks = tracker->update(objs);
-            }
-            if (draw_result) {
-                for (const auto &t : last_tracks) {
-                    int x  = int(t.tlwh[0]);
-                    int y  = int(t.tlwh[1]);
-                    int w  = int(t.tlwh[2]);
-                    int h  = int(t.tlwh[3]);
-                    int id    = t.track_id;
-                    int label = t.label;
-                    float score = t.score;
-
-                    cv::Scalar color = tracker->get_color(id);
-                    const char *label_name = get_label_name(label);
-
-                    char id_text[128];
-                    snprintf(id_text, sizeof(id_text), "%s ID:%d %.1f%%", label_name, id, score * 100.0f);
-
-                    cv::rectangle(ori_img, cv::Point(x, y), cv::Point(x + w, y + h),
-                                  color, 2);
-                    cv::putText(ori_img, id_text, cv::Point(x, y - 6),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.5, color);
-                }
-            }
-        } else if (draw_result) {
-            // 仅绘制检测框（无跟踪）
-            for (const auto &o : objs) {
-                cv::Scalar color = tracker->get_color(o.label);
-                const char *label_name = get_label_name(o.label);
-                char text[128];
-                snprintf(text, sizeof(text), "%s %.1f%%", label_name, o.prob * 100.0f);
-                cv::rectangle(ori_img, o.rect, color, 2);
-                cv::putText(ori_img, text, cv::Point((int)o.rect.x, (int)o.rect.y - 6),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, color);
-            }
-        }
-
         int64_t t3 = now_ms();
 
         rknn_outputs_release(rkModel, io_num.n_output, outputs.data());
 
-        acc_pre_ms += (t1 - t0);
-        acc_infer_ms += (t2 - t1);
-        acc_post_ms += (t3 - t2);
-        ++stat_frames;
-        if (stat_frames % 60 == 0) {
-            printf("[STATS] pre=%.2fms infer=%.2fms post+draw=%.2fms\n",
-                   acc_pre_ms / 60.0, acc_infer_ms / 60.0, acc_post_ms / 60.0);
-            acc_pre_ms = 0.0;
-            acc_infer_ms = 0.0;
-            acc_post_ms = 0.0;
+        if (timing) {
+            timing->pre_ms   = static_cast<double>(t1 - t0);
+            timing->infer_ms = static_cast<double>(t2 - t1);
+            timing->post_ms  = static_cast<double>(t3 - t2);
         }
-
-        ++frame_index;
         return 0;
     }
 
@@ -369,15 +312,7 @@ private:
     rknn_input inputs[1];
     int ret;
     int width, height, channel;
-    std::unique_ptr<BYTETracker> tracker;
     std::vector<uint8_t> input_buffer;
-    double acc_pre_ms = 0.0;
-    double acc_infer_ms = 0.0;
-    double acc_post_ms = 0.0;
-    int stat_frames = 0;
-    int frame_index = 0;
-    int track_interval = 1;
-    std::vector<STrack> last_tracks;
 
     bool preprocess_rga(const cv::Mat &bgr, cv::Mat &dst, const LETTER_BOX &letter_box)
     {
@@ -420,8 +355,8 @@ private:
         im_rect src_rect = {0, 0, bgr.cols, bgr.rows};
         im_rect dst_rect = {0, 0, letter_box.resize_width, letter_box.resize_height};
 
-        int ret = imcheck(src, dst_roi, src_rect, dst_rect);
-        if (IM_STATUS_NOERROR == ret) {
+        int rc = imcheck(src, dst_roi, src_rect, dst_rect);
+        if (IM_STATUS_NOERROR == rc) {
             IM_STATUS status = imresize(src, dst_roi);
             if (status == IM_STATUS_SUCCESS) {
                 return true;
@@ -434,8 +369,8 @@ private:
             return false;
         }
         rga_buffer_t rgb_buf = wrapbuffer_virtualaddr((void *)rgb_tmp.data, bgr.cols, bgr.rows, RK_FORMAT_RGB_888);
-        ret = imcheck(src, rgb_buf, src_rect, src_rect);
-        if (IM_STATUS_NOERROR != ret) {
+        rc = imcheck(src, rgb_buf, src_rect, src_rect);
+        if (IM_STATUS_NOERROR != rc) {
             return false;
         }
         IM_STATUS cvt_status = imcvtcolor(src, rgb_buf, RK_FORMAT_BGR_888, RK_FORMAT_RGB_888);
@@ -444,8 +379,8 @@ private:
         }
 
         rga_buffer_t rgb_src = wrapbuffer_virtualaddr((void *)rgb_tmp.data, bgr.cols, bgr.rows, RK_FORMAT_RGB_888);
-        ret = imcheck(rgb_src, dst_roi, src_rect, dst_rect);
-        if (IM_STATUS_NOERROR != ret) {
+        rc = imcheck(rgb_src, dst_roi, src_rect, dst_rect);
+        if (IM_STATUS_NOERROR != rc) {
             return false;
         }
         IM_STATUS resize_status = imresize(rgb_src, dst_roi);
@@ -461,6 +396,77 @@ private:
         gettimeofday(&tv, nullptr);
         return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
     }
+};
+
+// 单帧推理结果（保序传回主线程）
+struct InferResult {
+    int frame_index = -1;
+    cv::Mat img;                  // 待绘制/编码的原帧（与提交时同一 Mat 数据）
+    std::vector<Object> objs;     // 原图坐标系检测框
+    InferTiming timing;
+    bool ok = false;
+};
+
+// NPU 多核推理池：N 个 rknn_lite 实例绑核 0..N-1，由 ThreadPool 调度。
+// 任务从空闲表取一个实例使用，用完归还；submit 返回 future，由主线程按帧序消费。
+class RknnPool
+{
+public:
+    RknnPool(const char *model_path, int num_cores, bool enable_rga)
+        : enable_rga_(enable_rga), pool_(static_cast<size_t>(num_cores < 1 ? 1 : num_cores))
+    {
+        if (num_cores < 1) num_cores = 1;
+        if (num_cores > 3) num_cores = 3;   // RK3588 共 3 个 NPU 核
+        for (int i = 0; i < num_cores; ++i) {
+            instances_.emplace_back(
+                std::make_unique<rknn_lite>(const_cast<char *>(model_path), i, i));
+            free_.push(instances_.back().get());
+        }
+    }
+
+    size_t size() const { return instances_.size(); }
+
+    // 预热标签加载（避免首批并发任务同时触发 lazy load）
+    void warmup() const { (void)get_label_name(0); }
+
+    std::future<InferResult> submit(int frame_index, cv::Mat img)
+    {
+        return pool_.submit([this, frame_index, img]() -> InferResult {
+            InferResult r;
+            r.frame_index = frame_index;
+            r.img = img;
+            rknn_lite *inst = acquire();
+            r.ok = (inst->infer_only(img, r.objs, enable_rga_, &r.timing) == 0);
+            release(inst);
+            return r;
+        });
+    }
+
+private:
+    rknn_lite *acquire()
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [this]() { return !free_.empty(); });
+        rknn_lite *p = free_.front();
+        free_.pop();
+        return p;
+    }
+
+    void release(rknn_lite *p)
+    {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            free_.push(p);
+        }
+        cv_.notify_one();
+    }
+
+    bool enable_rga_;
+    std::vector<std::unique_ptr<rknn_lite>> instances_;
+    std::queue<rknn_lite *> free_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    dpool::ThreadPool pool_;
 };
 
 
