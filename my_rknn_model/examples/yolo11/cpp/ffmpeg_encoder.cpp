@@ -19,7 +19,7 @@ bool FfmpegEncoder::open(const std::string &output_path, int width, int height, 
     height_ = height;
     fps_ = fps > 0 ? fps : 30;
 
-    AVCodec *codec = avcodec_find_encoder_by_name(codec_name.c_str());
+    const AVCodec *codec = avcodec_find_encoder_by_name(codec_name.c_str());
     if (!codec) {
         printf("[ERROR] ffmpeg: encoder not found: %s\n", codec_name.c_str());
         return false;
@@ -50,16 +50,22 @@ bool FfmpegEncoder::open(const std::string &output_path, int width, int height, 
     codec_ctx_->framerate = AVRational{fps_, 1};
     codec_ctx_->gop_size = fps_;
     codec_ctx_->max_b_frames = 0;
-    codec_ctx_->pix_fmt = AV_PIX_FMT_NV12;
+    // ffmpeg-rockchip 的 rkmpp 编码器支持 BGR24 输入，色彩转换由 MPP 硬件完成
+    codec_ctx_->pix_fmt = in_pix_fmt_;
     codec_ctx_->bit_rate = 4 * 1000 * 1000;
 
     if (fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
         codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
+    // MPP 编码器私有参数（码率控制等），需在 avcodec_open2 之前设置
+    set_rkmpp_options();
+
     ret = avcodec_open2(codec_ctx_, codec, nullptr);
     if (ret < 0) {
         log_error("codec_open", ret);
+        printf("[ERROR] ffmpeg: 若提示像素格式不支持，可能该 ffmpeg-rockchip 编码器未启用 BGR 输入，"
+               "需改用 NV12 + RGA 预转换\n");
         return false;
     }
 
@@ -85,7 +91,17 @@ bool FfmpegEncoder::open(const std::string &output_path, int width, int height, 
         return false;
     }
 
-    if (!init_sws(width_, height_)) {
+    frame_ = av_frame_alloc();
+    if (!frame_) {
+        printf("[ERROR] ffmpeg: failed to allocate frame\n");
+        return false;
+    }
+    frame_->format = in_pix_fmt_;
+    frame_->width = width_;
+    frame_->height = height_;
+    ret = av_frame_get_buffer(frame_, 32);
+    if (ret < 0) {
+        log_error("frame_get_buffer", ret);
         return false;
     }
 
@@ -93,32 +109,24 @@ bool FfmpegEncoder::open(const std::string &output_path, int width, int height, 
     return true;
 }
 
-bool FfmpegEncoder::init_sws(int width, int height)
+void FfmpegEncoder::set_rkmpp_options()
 {
-    sws_ctx_ = sws_getContext(width, height, AV_PIX_FMT_BGR24,
-                              width, height, AV_PIX_FMT_NV12,
-                              SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws_ctx_) {
-        printf("[ERROR] ffmpeg: failed to create sws context\n");
-        return false;
+    if (!codec_ctx_ || !codec_ctx_->priv_data) {
+        return;
     }
-
-    frame_ = av_frame_alloc();
-    if (!frame_) {
-        printf("[ERROR] ffmpeg: failed to allocate frame\n");
-        return false;
+    // 这些是 ffmpeg-rockchip rkmpp 编码器的私有选项；不同版本可能略有差异，
+    // 设置失败仅告警、不致命（用 av_opt_set 的返回值判断）。
+    struct { const char *key; const char *val; } opts[] = {
+        {"rc_mode", "CBR"},        // 码率控制：CBR/VBR/CQP/AVBR
+        {"profile", "high"},       // H.264 profile
+        {"level", "40"},           // Level 4.0
+    };
+    for (const auto &o : opts) {
+        int r = av_opt_set(codec_ctx_->priv_data, o.key, o.val, 0);
+        if (r < 0) {
+            printf("[WARN] ffmpeg: rkmpp option '%s=%s' 未生效(可能该版本不支持)\n", o.key, o.val);
+        }
     }
-
-    frame_->format = codec_ctx_->pix_fmt;
-    frame_->width = width;
-    frame_->height = height;
-
-    int ret = av_frame_get_buffer(frame_, 32);
-    if (ret < 0) {
-        log_error("frame_get_buffer", ret);
-        return false;
-    }
-    return true;
 }
 
 bool FfmpegEncoder::encode_frame(AVFrame *frame)
@@ -161,23 +169,15 @@ bool FfmpegEncoder::encode_frame(AVFrame *frame)
     return true;
 }
 
-bool FfmpegEncoder::write(const cv::Mat &bgr_frame)
+bool FfmpegEncoder::fill_frame_from_bgr(const cv::Mat &bgr_frame)
 {
-    if (!opened_ || !codec_ctx_ || !sws_ctx_ || !frame_) {
+    // 输入应为 8UC3 BGR，尺寸与编码器一致
+    if (bgr_frame.type() != CV_8UC3 ||
+        bgr_frame.cols != width_ || bgr_frame.rows != height_) {
+        printf("[ERROR] ffmpeg: 输入帧格式/尺寸不匹配 (type=%d %dx%d, 期望 8UC3 %dx%d)\n",
+               bgr_frame.type(), bgr_frame.cols, bgr_frame.rows, width_, height_);
         return false;
     }
-
-    if (bgr_frame.empty()) {
-        return false;
-    }
-
-    cv::Mat input = bgr_frame;
-    if (!input.isContinuous()) {
-        input = input.clone();
-    }
-
-    const uint8_t *in_data[1] = { input.data };
-    int in_linesize[1] = { static_cast<int>(input.step[0]) };
 
     int ret = av_frame_make_writable(frame_);
     if (ret < 0) {
@@ -185,10 +185,27 @@ bool FfmpegEncoder::write(const cv::Mat &bgr_frame)
         return false;
     }
 
-    sws_scale(sws_ctx_, in_data, in_linesize, 0, height_, frame_->data, frame_->linesize);
+    // BGR24 为单平面紧凑格式，逐行拷贝以兼容 OpenCV 与 AVFrame 各自的 stride
+    av_image_copy_plane(frame_->data[0], frame_->linesize[0],
+                        bgr_frame.data, static_cast<int>(bgr_frame.step[0]),
+                        width_ * 3, height_);
+    return true;
+}
+
+bool FfmpegEncoder::write(const cv::Mat &bgr_frame)
+{
+    if (!opened_ || !codec_ctx_ || !frame_) {
+        return false;
+    }
+    if (bgr_frame.empty()) {
+        return false;
+    }
+
+    if (!fill_frame_from_bgr(bgr_frame)) {
+        return false;
+    }
 
     frame_->pts = frame_index_++;
-
     return encode_frame(frame_);
 }
 
@@ -207,11 +224,6 @@ void FfmpegEncoder::close()
     if (frame_) {
         av_frame_free(&frame_);
         frame_ = nullptr;
-    }
-
-    if (sws_ctx_) {
-        sws_freeContext(sws_ctx_);
-        sws_ctx_ = nullptr;
     }
 
     if (codec_ctx_) {
@@ -236,4 +248,3 @@ void FfmpegEncoder::log_error(const char *stage, int err) const
     av_strerror(err, errbuf, sizeof(errbuf));
     printf("[ERROR] ffmpeg: %s failed: %s\n", stage, errbuf);
 }
-

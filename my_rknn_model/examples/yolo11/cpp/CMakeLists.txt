@@ -4,23 +4,20 @@ project(rknn_yolo11_demo)
 
 
 # 新增：查找OpenCV包
-set(OpenCV_DIR "/home/forlinx/Documents/aarch64/lib/cmake/opencv4")
+set(OpenCV_DIR "/home/forlinx/Documents/ffmpeg_rockchip_with_mpp/aarch64_rockchip/usr/local/lib/cmake/opencv4")
 find_package(OpenCV REQUIRED)
-#set(OpenCV_INCLUDE_DIRS /home/forlinx/opencv_aarch64/include/opencv4)
-link_directories("/home/forlinx/Documents/aarch64/lib")
-
+link_directories("/home/forlinx/Documents/ffmpeg_rockchip_with_mpp/aarch64_rockchip/usr/local/lib")
 
 message(STATUS "OpenCV library status:")
 message(STATUS "    version: ${OpenCV_VERSION}")
 message(STATUS "    libraries: ${OpenCV_LIBS}")
 message(STATUS "    include path: ${OpenCV_INCLUDE_DIRS}")
 
-
 # 指定 FFmpeg 头文件路径
-include_directories(/home/forlinx/Documents/aarch64/include)
+include_directories(/home/forlinx/Documents/ffmpeg_rockchip_with_mpp/aarch64_rockchip/usr/local/include)
 
-# 指定 FFmpeg 库文件路径（.so 或 .a 文件所在目录）
-link_directories(/home/forlinx/Documents/aarch64/lib)
+# 指定 FFmpeg 库文件路径
+link_directories(/home/forlinx/Documents/ffmpeg_rockchip_with_mpp/aarch64_rockchip/usr/local/lib)
 
 # rknn api
 set(RKNN_API_PATH ${CMAKE_SOURCE_DIR}/../../runtime/RK3588/${CMAKE_SYSTEM_NAME}/librknn_api)
@@ -104,11 +101,11 @@ target_link_libraries(${PROJECT_NAME}
     dl
     pthread
     swscale
+    swresample
     avcodec
     avformat
     avutil
     x264      # 必须手动添加
-    xvidcore  # 必须手动添加
 )
 
 #链接phtead库
