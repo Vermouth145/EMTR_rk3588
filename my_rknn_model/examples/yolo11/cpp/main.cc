@@ -32,6 +32,7 @@ static void print_usage()
     printf("  ./rknn_yolo11_demo <模型路径> --camera <索引> [--output out.avi] [--codec XVID] [--fps 30]\n");
     printf("可选参数: --no-draw --no-track --use-rga --track-interval <N> --queue-size <N> --max-frames <N>\n");
     printf("          --json <path> --no-json\n");
+    printf("          --cam-height <米> --cam-tilt <度> --focal <像素>  (地平面测距相机几何)\n");
 }
 
 static bool starts_with(const std::string &s, const std::string &prefix)
@@ -85,6 +86,10 @@ struct AppOptions {
     int track_interval = 1;
     bool enable_json = true;
     std::string json_path = "threat.jsonl";
+    // 相机几何（地平面测距）。默认按 LLVIP 可见光原始视频的典型监控经验值。
+    double cam_height = 6.0;      // 安装高度（米）
+    double cam_tilt_deg = 15.0;  // 俯仰角（度，光轴相对水平向下为正）
+    double focal_px = 1200.0;    // 像素焦距
 };
 
 int main(int argc, char **argv)
@@ -142,6 +147,15 @@ int main(int argc, char **argv)
                     ERROR_LOG("Invalid track interval");
                     return -1;
                 }
+            } else if (arg == "--cam-height") {
+                if (i + 1 >= argc) { print_usage(); return -1; }
+                opts.cam_height = std::atof(argv[++i]);
+            } else if (arg == "--cam-tilt") {
+                if (i + 1 >= argc) { print_usage(); return -1; }
+                opts.cam_tilt_deg = std::atof(argv[++i]);
+            } else if (arg == "--focal") {
+                if (i + 1 >= argc) { print_usage(); return -1; }
+                opts.focal_px = std::atof(argv[++i]);
             } else if (arg == "--no-json") {
                 opts.enable_json = false;
             } else if (arg == "--json") {
@@ -234,6 +248,11 @@ int main(int argc, char **argv)
     }
 
     ThreatAnalyzer threat_analyzer(static_cast<double>(video_fps));
+    threat_analyzer.set_image_size(video_width, video_height);
+    threat_analyzer.set_camera_geometry(opts.cam_height, opts.cam_tilt_deg);
+    threat_analyzer.set_focal_px(opts.focal_px);
+    printf("地平面测距: 相机高度=%.1fm 俯角=%.1f° 焦距=%.0fpx (帧 %dx%d)\n",
+           opts.cam_height, opts.cam_tilt_deg, opts.focal_px, video_width, video_height);
     ThreatLogger threat_logger;
     if (opts.enable_json) {
         if (!threat_logger.open(opts.json_path)) {
