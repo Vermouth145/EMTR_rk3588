@@ -12,7 +12,7 @@
 #define OBJ_NUMB_MAX_SIZE 128
 #define OBJ_CLASS_NUM 3
 #define NMS_THRESH 0.45
-#define BOX_THRESH 0.25
+#define BOX_THRESH 0.3   // 置信度过滤阈值，对齐测试说明 TC-UT-16（0.3）
 #define PROP_BOX_SIZE (5 + OBJ_CLASS_NUM)
 //#define NMS_THRESHOLD 0.45
 //#define CONF_THRESHOLD 0.25

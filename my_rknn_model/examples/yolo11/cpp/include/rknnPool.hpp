@@ -286,14 +286,20 @@ public:
                      &detect_result_group, width, height, io_num, output_attrs, true, 1);
 
         // 只取 cameraid==1 的结果
+        // 超大框面积过滤（对齐测试说明 TC-UT-16）：面积占比 > 0.9 的检测框视为不合理并删除。
+        const double frame_area = static_cast<double>(img_width) * static_cast<double>(img_height);
         std::vector<Object> objs;
         for (int i = 0; i < detect_result_group.count; ++i) {
             detect_result_t *d = &detect_result_group.results[i];
             if (d->cameraid != 1) continue;
+            int bw = d->box.right - d->box.left;
+            int bh = d->box.bottom - d->box.top;
+            if (frame_area > 0.0 &&
+                static_cast<double>(bw) * static_cast<double>(bh) > 0.9 * frame_area) {
+                continue;  // 删除超大（面积占比>0.9）的不合理检测框
+            }
             Object o;
-            o.rect  = cv::Rect(d->box.left, d->box.top,
-                               d->box.right - d->box.left,
-                               d->box.bottom - d->box.top);
+            o.rect  = cv::Rect(d->box.left, d->box.top, bw, bh);
             o.prob  = d->prop;
             o.label = d->class_index;
             objs.push_back(o);

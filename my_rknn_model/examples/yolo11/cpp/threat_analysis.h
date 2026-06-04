@@ -14,15 +14,17 @@
 //           dist = real_height * focal_ref / bbox_h（对齐 video_alarm.py）。
 //   - 测速：speed_window 帧滑动窗口。脚点有效时用真实地平面坐标(米)位移；
 //           兜底时用中心点像素位移按 dist/focal 折算。输出 km/h。
-//   - 威胁度：threat_score = w_dist*s_dist + w_speed*s_speed ∈ [0,1]
-//   - 危险判定：dist < warning_range 且 threat_score > threshold
+//   - 威胁度：threat_score = (w_dist*s_dist + w_speed*s_speed) * 100 ∈ [0,100]
+//             （量程对齐测试说明 TC-UT-20：0~100）
+//   - 危险判定：dist < warning_range 且 threat_score > threshold(默认 70)
 // 在脚本基础上额外保留三种行为类型（fast_approach / sudden_appear / loitering）。
 struct ThreatResult {
     const char *type = "normal";    // 行为类型：fast_approach / sudden_appear / loitering / normal
-    double threat_score = 0.0;      // 威胁度 0.0 - 1.0
+    double threat_score = 0.0;      // 威胁度 0 - 100（TC-UT-20 量程）
     bool is_dangerous = false;      // 是否危险（dist<warning_range 且 score>threshold）
     double distance_m = -1.0;       // 估计距离（米），-1 表示无效
-    double speed_kmh = 0.0;         // 估计速度（km/h）
+    double speed_mps = 0.0;         // 估计速度（m/s，TC-UT-18 要求单位）
+    double speed_kmh = 0.0;         // 估计速度（km/h，保留供行为判定/参考）
     double dwell_s = 0.0;           // 目标存活/逗留时间（秒）
 };
 
@@ -35,6 +37,7 @@ struct ThreatLogRecord {
     int w = 0;
     int h = 0;
     double distance_m = -1.0;
+    double speed_mps = 0.0;
     double speed_kmh = 0.0;
     double threat_score = 0.0;
     bool is_dangerous = false;
@@ -77,6 +80,9 @@ public:
     void set_camera_geometry(double height_m, double tilt_deg);
     // 设置像素焦距（与拍摄分辨率/镜头相关）。默认 1200。
     void set_focal_px(double focal_px);
+    // 设置预警距离（米）。同时用于危险判定的距离门控与威胁度的距离归一化尺度。
+    // 默认 150（满足测试说明 TC-UT-21“预警距离≥150m”）。
+    void set_warning_range(double range_m);
     ThreatResult update(int frame_index, int track_id, int label, const ThreatBBox &box);
     void purge_stale(int current_frame, int max_age_frames);
 
@@ -122,8 +128,8 @@ private:
 
     // ---- 算法参数（对齐 video_alarm.py）----
     double focal_ref_ = 1200.0;       // FOCAL_REF：焦距参考值（与拍摄分辨率/镜头相关，需按相机标定）
-    double warning_range_ = 15.0;     // WARNING_RANGE：预警距离（米）
-    double threat_threshold_ = 0.6;   // THREAT_THRESHOLD：危险威胁度阈值
+    double warning_range_ = 150.0;    // WARNING_RANGE：预警距离（米），TC-UT-21 要求≥150m
+    double threat_threshold_ = 70.0;  // THREAT_THRESHOLD：危险威胁度阈值（0~100，TC-UT-21 默认 70）
     double w_dist_ = 0.6;             // W_DIST：距离权重
     double w_speed_ = 0.4;            // W_SPEED：速度权重
     double max_speed_kmh_ = 20.0;     // 速度归一化上限（km/h）

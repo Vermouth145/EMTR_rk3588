@@ -28,11 +28,12 @@ static void print_usage()
 {
     printf("使用方法:\n");
     printf("  ./rknn_yolo11_demo <模型路径> <视频路径>\n");
-    printf("  ./rknn_yolo11_demo <模型路径> --input <视频/rtsp路径> [--output out.mp4] [--codec h264_rkmpp] [--fps 30]\n");
+    printf("  ./rknn_yolo11_demo <模型路径> --input <视频/rtsp路径> [--output out.mp4] [--codec h264_rkmpp|hevc_rkmpp] [--fps 30]\n");
     printf("  ./rknn_yolo11_demo <模型路径> --camera <索引> [--output out.avi] [--codec XVID] [--fps 30]\n");
     printf("可选参数: --no-draw --no-track --use-rga --track-interval <N> --queue-size <N> --max-frames <N>\n");
     printf("          --json <path> --no-json\n");
     printf("          --cam-height <米> --cam-tilt <度> --focal <像素>  (地平面测距相机几何)\n");
+    printf("          --warning-range <米>  (预警距离，默认150，TC-UT-21要求≥150)\n");
 }
 
 static bool starts_with(const std::string &s, const std::string &prefix)
@@ -90,6 +91,7 @@ struct AppOptions {
     double cam_height = 6.0;      // 安装高度（米）
     double cam_tilt_deg = 15.0;  // 俯仰角（度，光轴相对水平向下为正）
     double focal_px = 1200.0;    // 像素焦距
+    double warning_range = 150.0;// 预警距离（米），TC-UT-21 要求≥150m
 };
 
 int main(int argc, char **argv)
@@ -156,6 +158,9 @@ int main(int argc, char **argv)
             } else if (arg == "--focal") {
                 if (i + 1 >= argc) { print_usage(); return -1; }
                 opts.focal_px = std::atof(argv[++i]);
+            } else if (arg == "--warning-range") {
+                if (i + 1 >= argc) { print_usage(); return -1; }
+                opts.warning_range = std::atof(argv[++i]);
             } else if (arg == "--no-json") {
                 opts.enable_json = false;
             } else if (arg == "--json") {
@@ -231,10 +236,13 @@ int main(int argc, char **argv)
     bool use_ffmpeg = false;
     if (enable_writer) {
         std::string codec_lower = to_lower(opts.codec);
-        if (!codec_lower.empty() && codec_lower == "h264_rkmpp") {
+        // 任意 *_rkmpp 编码器（h264_rkmpp / hevc_rkmpp(H.265)）走瑞芯微 MPP 硬编码（TC-UT-10）。
+        bool is_rkmpp = (codec_lower.size() > 6 &&
+                         codec_lower.compare(codec_lower.size() - 6, 6, "_rkmpp") == 0);
+        if (is_rkmpp) {
             use_ffmpeg = true;
-            if (!ffmpeg_writer.open(opts.output_path, video_width, video_height, video_fps, "h264_rkmpp")) {
-                ERROR_LOG("Failed to open FFmpeg encoder");
+            if (!ffmpeg_writer.open(opts.output_path, video_width, video_height, video_fps, codec_lower)) {
+                ERROR_LOG("Failed to open FFmpeg encoder (%s)", codec_lower.c_str());
                 return -1;
             }
         } else {
@@ -251,6 +259,7 @@ int main(int argc, char **argv)
     threat_analyzer.set_image_size(video_width, video_height);
     threat_analyzer.set_camera_geometry(opts.cam_height, opts.cam_tilt_deg);
     threat_analyzer.set_focal_px(opts.focal_px);
+    threat_analyzer.set_warning_range(opts.warning_range);
     printf("地平面测距: 相机高度=%.1fm 俯角=%.1f° 焦距=%.0fpx (帧 %dx%d)\n",
            opts.cam_height, opts.cam_tilt_deg, opts.focal_px, video_width, video_height);
     ThreatLogger threat_logger;
@@ -352,9 +361,9 @@ int main(int argc, char **argv)
                 ThreatResult result = threat_analyzer.update(frame_index, t.track_id, t.label, box);
 
                 char threat_text[160];
-                snprintf(threat_text, sizeof(threat_text), "%sD%.1fm V%.1fkm/h T%.2f %s",
+                snprintf(threat_text, sizeof(threat_text), "%sD%.1fm V%.1fm/s T%.0f %s",
                          result.is_dangerous ? "[DANGER] " : "",
-                         result.distance_m, result.speed_kmh, result.threat_score, result.type);
+                         result.distance_m, result.speed_mps, result.threat_score, result.type);
 
                 // 危险目标红色，否则黄色（对齐 video_alarm.py 的红/绿配色思路）
                 cv::Scalar threat_color = result.is_dangerous ? cv::Scalar(0, 0, 255)
@@ -374,6 +383,7 @@ int main(int argc, char **argv)
                     rec.w = box.w;
                     rec.h = box.h;
                     rec.distance_m = result.distance_m;
+                    rec.speed_mps = result.speed_mps;
                     rec.speed_kmh = result.speed_kmh;
                     rec.threat_score = result.threat_score;
                     rec.is_dangerous = result.is_dangerous;

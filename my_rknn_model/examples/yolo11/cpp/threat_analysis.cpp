@@ -43,11 +43,11 @@ void ThreatLogger::log(const ThreatLogRecord &record)
     }
     fprintf(fp_,
             "{\"frame\":%d,\"track_id\":%d,\"label\":%d,\"bbox\":[%d,%d,%d,%d],"
-            "\"distance_m\":%.3f,\"speed_kmh\":%.3f,\"threat_score\":%.3f,"
+            "\"distance_m\":%.3f,\"speed_mps\":%.3f,\"speed_kmh\":%.3f,\"threat_score\":%.2f,"
             "\"dangerous\":%s,\"type\":\"%s\"}\n",
             record.frame_index, record.track_id, record.label,
             record.x, record.y, record.w, record.h,
-            record.distance_m, record.speed_kmh, record.threat_score,
+            record.distance_m, record.speed_mps, record.speed_kmh, record.threat_score,
             record.is_dangerous ? "true" : "false", record.type);
     if (++unflushed_ >= kFlushInterval) {
         fflush(fp_);
@@ -95,6 +95,13 @@ void ThreatAnalyzer::set_focal_px(double focal_px)
 {
     if (focal_px > 1.0) {
         focal_ref_ = focal_px;
+    }
+}
+
+void ThreatAnalyzer::set_warning_range(double range_m)
+{
+    if (range_m > 0.0) {
+        warning_range_ = range_m;
     }
 }
 
@@ -194,6 +201,7 @@ ThreatResult ThreatAnalyzer::update(int frame_index, int track_id, int label, co
     result.is_dangerous = danger;
     result.distance_m = dist;
     result.speed_kmh = speed_kmh;
+    result.speed_mps = speed_kmh / 3.6;   // TC-UT-18 要求以 m/s 标注/判据
     result.dwell_s = dwell_s;
     return result;
 }
@@ -222,7 +230,8 @@ double ThreatAnalyzer::compute_threat_score(double distance_m, double speed_kmh)
     s_dist = std::max(0.0, std::min(1.0, s_dist));
     // s_speed = min(1, speed/max_speed)
     double s_speed = std::max(0.0, std::min(1.0, speed_kmh / max_speed_kmh_));
-    return w_dist_ * s_dist + w_speed_ * s_speed;
+    // 量程 0~100（对齐测试说明 TC-UT-20）
+    return (w_dist_ * s_dist + w_speed_ * s_speed) * 100.0;
 }
 
 // 地平面落脚点测距：把脚点像素 (u,v) 投影到地平面，求相机到目标的水平距离。

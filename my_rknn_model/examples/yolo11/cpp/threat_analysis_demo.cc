@@ -25,6 +25,7 @@ int main()
         rec.w = box.w;
         rec.h = box.h;
         rec.distance_m = result.distance_m;
+        rec.speed_mps = result.speed_mps;
         rec.speed_kmh = result.speed_kmh;
         rec.threat_score = result.threat_score;
         rec.is_dangerous = result.is_dangerous;
@@ -32,8 +33,8 @@ int main()
         logger.log(rec);
 
         if (frame % 10 == 0) {
-            printf("frame=%d dist=%.2f speed=%.2fkm/h threat=%.2f danger=%d type=%s\n",
-                   frame, result.distance_m, result.speed_kmh, result.threat_score,
+            printf("frame=%d dist=%.2f speed=%.2fm/s threat=%.1f danger=%d type=%s\n",
+                   frame, result.distance_m, result.speed_mps, result.threat_score,
                    result.is_dangerous ? 1 : 0, result.type);
         }
     }
